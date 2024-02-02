@@ -7,6 +7,18 @@ from pyftpdlib.authorizers import DummyAuthorizer
 from pyftpdlib.handlers import FTPHandler
 from pyftpdlib.servers import FTPServer
 
+
+class Result:
+    def __init__(self, username, user_code, result, passed):
+        self.username = username
+        self.user_code = user_code
+        self.result = result
+        self.passed = passed
+
+
+# Create dictionary with username as key and result as value
+attempted_users = {}
+passed_users = {}
 flagged_for_deletion_paths = []
 notations = {
     "O(1)": 0.1,
@@ -26,7 +38,7 @@ def big_o_notation_time_thresholds(seed):
     return random.choice(list(notations.values()))
 
 
-def evaluate_code(user_code, time_threshold):
+def evaluate_code_threaded(username, user_code, time_threshold):
     # Sanitize user code
     user_code = user_code.replace("import", "# import")
     user_code = user_code.replace("print", "# print")
@@ -41,20 +53,65 @@ def evaluate_code(user_code, time_threshold):
     user_code = user_code.replace("tempfile", "# tempfile")
     user_code = user_code.replace("input", "# input")
 
-    start_time = time.time()
-    try:
-        exec(user_code)
-        elapsed_time = time.time() - start_time
-        print(f"Elapsed time: {elapsed_time}")
-    except Exception as e:
-        return f"Error executing code: {e}"
+    # Add more replacements as needed
 
-    # To win, the code must be approximately equal to the time threshold.
-    # For example, if the time threshold is 1, the code must be between 0.9 and 1.1
-    if time_threshold - 0.1 <= elapsed_time <= time_threshold + 0.1:
-        return True
-    else:
-        return f"Time requirement not met. Expected: {time_threshold}, Got: {elapsed_time}"
+    # Function to run user code
+    def run_user_code():
+        try:
+            start_time = time.time()
+            exec(user_code)
+            elapsed_time = time.time() - start_time
+            if time_threshold - 0.1 <= elapsed_time <= time_threshold + 0.1:
+                attempted_users[username] = Result(username, user_code, f"Passed with {elapsed_time}, needed {time_threshold}", True)
+            else:
+                attempted_users[username] = Result(username, user_code, f"Time requirement not met. Expected: {time_threshold}, Got: {elapsed_time}", False)
+        except Exception as e:
+            return f"Error executing code: {e}"
+
+    # Run user code in a separate thread with timeout
+    thread = threading.Thread(target=run_user_code)
+    thread.start()
+    thread.join(time_threshold)
+
+
+def check_attempts():
+    print("Checking attempts...")
+    flagged_for_user_deletion = []
+    for user in attempted_users:
+        print(f"Checking {user}")
+        result = attempted_users[user]
+        if result.passed:
+            passed_dir = f"./lock_files/passed/{user}_latest_passed.py"
+            print(f"{user} passed with {result.result}")
+            # Override the file in the passed folder, or create a new one if it doesn't exist
+            with open(passed_dir, "w") as file:
+                file.write(result.user_code)
+                file.close()
+            passed_users[user] = result
+        else:
+            attempt_dir = f"./lock_files/attempts/{user}_latest_attempt.py"
+            print(f"{user} didn't crack the safe, result: {result.result}")
+            # Move the file to the attempts folder
+            with open(attempt_dir, "w") as file:
+                file.write(result.user_code)
+                file.close()
+        # Add the file path to the list of files to be deleted
+        flagged_for_user_deletion.append(user)
+        flagged_for_deletion_paths.append(f"./lock_files/{user}.py")
+
+    for user in flagged_for_user_deletion:
+        del attempted_users[user]
+
+    # Delete the files
+    for file_path in flagged_for_deletion_paths:
+        try:
+            os.remove(file_path)
+        except FileNotFoundError:
+            pass
+
+    flagged_for_deletion_paths.clear()
+
+    print("Done checking attempts.")
 
 
 def check_files(time_threshold=big_o_notation_time_thresholds(0)):
@@ -62,33 +119,21 @@ def check_files(time_threshold=big_o_notation_time_thresholds(0)):
         print("Checking files...")
         for user in user_names:
             file_path = f"./lock_files/{user}.py"
+            if user in attempted_users and attempted_users[user].passed:
+                print(f"{user} already passed, skipping...")
+                flagged_for_deletion_paths.append(file_path)
+                continue
             try:
                 with open(file_path, "r") as file:
                     print(f"Checking {user}.py")
                     user_code = file.read()
-                    result = evaluate_code(user_code, time_threshold)
-                    if result is not True:
-                        print(result)
-                        # Make a copy of the file and move it to the ./attempts directory
-                        with open(f"./lock_files/attempts/{user}_latest_attempt.py", "w") as f:
-                            f.write(f"# {result}\n")
-                            f.write(user_code)
-                    else:
-                        print(f"{user} passed the time requirement of {time_threshold}.")
-                        # Make a copy of the file and move it to the ./passed directory
-                        with open(f"./lock_files/passed/{user}_latest_passed.py", "w") as f:
-                            f.write(user_code)
-                    # Add the file to the list of files to be deleted
-                    flagged_for_deletion_paths.append(file_path)
+                    evaluate_code_threaded(user, user_code, time_threshold)
+                    file.close()
             except FileNotFoundError:
                 pass
-        # Delete the files that were flagged for deletion
-        for file_path in flagged_for_deletion_paths:
-            os.remove(file_path)
-            print(f"Deleted {file_path}")
-        flagged_for_deletion_paths.clear()
         print("Done checking files.")
-        time.sleep(3)
+        check_attempts()
+        time.sleep(5)
 
 
 # Add the usernames to the list
